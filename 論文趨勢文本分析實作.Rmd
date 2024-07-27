@@ -1,0 +1,316 @@
+---
+title: "論文趨勢分析實作"
+author: "Raymond"
+date: "2024-07-27"
+output: html_document
+---
+
+```{r echo=F, results='hide', message=FALSE, warning=FALSE}
+rm(list=ls(all=T))
+knitr::opts_chunk$set(comment = NA)
+knitr::opts_chunk$set(paged.print=FALSE)
+knitr::opts_knit$set(global.par = TRUE)
+par(cex=0.8); options(scipen=20, digits=4, width=90)
+library(openxlsx)
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(ggplot2)
+library(doSNOW)
+library(caret)
+library(quanteda)
+library(quanteda.textplots)
+library(quanteda.textstats)
+library(dplyr)
+library(lubridate)
+library(wordcloud)
+library(topicmodels)
+library(LDAvis)
+library(servr)
+library(igraph)
+library(ggraph)
+library(readxl)
+library(tidyr)
+library(tidytext)
+library(cluster)
+library(factoextra)
+library(text)
+library(RColorBrewer)
+library(slam)
+library(wordcloud2)
+library(igraph)
+library(ggraph)
+```
+
+
+# 資料前處理
+
+依照老師的意思將所有有空格的關鍵字都加上hyphen
+```{r echo=F, message=FALSE, warning=FALSE}
+# 定義一個函數來讀取Excel文件並選取特定的列
+read_and_select <- function(file_path) {
+  sheet_names <- excel_sheets(file_path)
+  selected_data_list <- list()
+  
+  for (sheet in sheet_names) {
+    data <- read_excel(file_path, sheet = sheet)
+    selected_data <- data %>% select(dplyr::one_of("Author Keywords", "Publication Year"))
+    selected_data_list[[sheet]] <- selected_data
+  }
+  
+  combined_data <- bind_rows(selected_data_list)
+  return(combined_data)
+}
+
+
+# 設置兩個Excel文件的路徑
+file_path1 <- "C:/Users/ASUS/Desktop/碩一下/基哥RA/文本分析/1-15_Marketing Journals.xlsx"
+file_path2 <- "C:/Users/ASUS/Desktop/碩一下/基哥RA/文本分析/16-30_Marketing Journals.xlsx"
+
+# 讀取並選取兩個Excel文件中的數據
+combined_data1 <- read_and_select(file_path1)
+combined_data2 <- read_and_select(file_path2)
+
+# 設置正確的列名
+colnames(combined_data1) <- c("keywords", "year")
+colnames(combined_data2) <- c("keywords", "year")
+
+# 合併兩個數據框
+j_combined <- bind_rows(combined_data1, combined_data2)
+
+
+# 濾除 NA 值
+j_combine_clean <- j_combined %>% filter(!is.na(keywords) & !is.na(year))
+
+
+j_combine_clean$TextLength <- nchar(j_combine_clean$keywords, keepNA = TRUE, type = "bytes")
+
+
+j_combine_clean$keywords <- gsub(" ", "-", j_combine_clean$keywords)
+
+# 創建文本語料庫
+corpus_keywords <- corpus(j_combine_clean$keywords, docvars = data.frame(Year = j_combine_clean$year))
+
+# 創建tokens，保留 -
+tokens_list <- tokens(corpus_keywords, what = "word", 
+                      remove_punct = TRUE, remove_symbols = TRUE, 
+                      remove_numbers = TRUE, split_hyphens = FALSE)
+
+# 檢測詞組
+collocations <- textstat_collocations(tokens_list, min_count = 5)
+
+# 使用tokens_compound來處理詞組
+tokens_list <- tokens_compound(tokens_list, pattern = phrase(collocations$collocation), concatenator = "-")
+
+# 移除停用詞並轉換為小寫
+tokens_list <- tokens_select(tokens_list, stopwords(), selection = "remove")
+tokens_list <- tokens_tolower(tokens_list)
+
+# 應用詞幹化
+tokens_list <- tokens_wordstem(tokens_list, language = "english")
+
+# 創建DFM
+dfm_keywords <- dfm(tokens_list)
+
+# 查看DFM
+print(dfm_keywords)
+summary(dfm_keywords)
+
+# 依日期計算詞頻
+dfm_time <- dfm_group(dfm_keywords, groups = docvars(dfm_keywords, "Year"))
+
+# 轉df
+dfm_time_df <- convert(dfm_time, to = "data.frame")
+dfm_time_df$Year <- rownames(dfm_time_df)
+
+
+```
+
+<br><br><br>
+
+# 分別查看總體前10關鍵字以及每年前10的關鍵字
+我們可以發現其實還是有許多意義不大的關鍵詞, 這部分可以後續由老師決定要刪掉那些, 在資料前處理的部分可以先做
+```{r echo=F, message=FALSE, warning=FALSE}
+# 計算總體前10個關鍵詞
+total_top10 <- topfeatures(dfm_keywords, 10)
+
+# 計算每年的前10個關鍵詞
+year_top10 <- lapply(unique(docvars(dfm_keywords, "Year")), function(year) {
+  dfm_year <- dfm_subset(dfm_keywords, Year == year)
+  topfeatures(dfm_year, 10)
+})
+
+# 將每年的結果轉換為數據框
+year_top10_df <- do.call(rbind, lapply(seq_along(year_top10), function(i) {
+  data.frame(Year = unique(docvars(dfm_keywords, "Year"))[i],
+             Keyword = names(year_top10[[i]]),
+             Frequency = year_top10[[i]])
+}))
+
+# 將總體的結果轉換為數據框
+total_top10_df <- data.frame(Keyword = names(total_top10), 
+                             Frequency = total_top10)
+
+# 查看結果
+print(total_top10_df)
+print(year_top10_df)
+```
+
+<br><br><br>
+
+
+# 視覺化總體前10關鍵字
+```{r echo=F, message=FALSE, warning=FALSE}
+# 繪製總體前10關鍵詞的條形圖
+total_plot <- ggplot(total_top10_df, aes(x = reorder(Keyword, Frequency), y = Frequency)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 10 Keywords Overall", x = "Keyword", y = "Frequency") +
+  theme_minimal()
+
+print(total_plot)
+```
+
+<br><br><br>
+
+
+# 視覺化每年前10關鍵字
+```{r echo=F, message=FALSE, warning=FALSE}
+# 繪製每年前10關鍵詞的條形圖
+yearly_plot <- ggplot(year_top10_df, aes(x = reorder(Keyword, Frequency), y = Frequency, fill = factor(Year))) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~ Year, scales = "free_y") +
+  labs(title = "Top 10 Keywords by Year", x = "Keyword", y = "Frequency") +
+  theme_minimal()
+
+print(yearly_plot)
+```
+
+<br><br><br>
+
+
+# 查看特定關鍵字隨時間變化的趨勢
+```{r echo=F, message=FALSE, warning=FALSE}
+# 使用ggplot2視覺化關鍵詞隨時間的趨勢
+dfm_time_df <- dfm_time_df %>% rename(keywords_year = doc_id)
+dfm_time_df$keywords_year <- as.numeric(as.character(dfm_time_df$keywords_year))
+
+ggplot(dfm_time_df, aes(x = keywords_year, y = `artificial-intellig`, group = 1)) +
+  geom_line(color = "blue", size = 1.2) +             # 設置線條顏色和粗細
+  geom_point(color = "red", size = 3) +               # 添加點並設置顏色和大小
+  labs(title = "特定關鍵詞隨時間變化趨勢分析(以artificial-intellig為例)", x = "年份", y = "頻率") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),  # 標題樣式
+    axis.title.x = element_text(size = 14, face = "bold"),             # x軸標題樣式
+    axis.title.y = element_text(size = 14, face = "bold"),             # y軸標題樣式
+    axis.text = element_text(size = 12),                               # 軸標籤樣式
+    panel.grid.major = element_line(color = "gray", size = 0.5),       # 主網格線樣式
+    panel.grid.minor = element_blank()                                 # 移除次網格線
+  )
+
+```
+
+<br><br><br>
+
+
+
+# 詞雲(這邊設定出現次數小於5次的低頻詞且最多顯示80個詞)
+```{r echo=F, message=FALSE, warning=FALSE}
+####詞雲
+
+# 計算詞頻
+word_freqs <- slam::col_sums(dfm_keywords)
+word_freqs_df <- data.frame(word = names(word_freqs), freq = word_freqs)
+
+# 過濾掉低頻詞，並限制顯示的最大單詞數
+min_freq <- 5
+max_words <- 80
+word_freqs_filtered <- word_freqs_df[word_freqs_df$freq >= min_freq, ]
+word_freqs_filtered <- head(word_freqs_filtered[order(word_freqs_filtered$freq, decreasing = TRUE), ], max_words)
+
+# 繪製美化的詞雲
+wordcloud2(data = word_freqs_filtered, size = 1, color = 'random-dark', shape = 'circle')
+```
+
+<br><br><br>
+
+# LDA主題模型
+這邊顯示的是經演算法分類過後, 特定論文主題最常出現的前10個關鍵字
+```{r message=FALSE, warning=FALSE}
+#Latent Dirichelet Allocation（LDA）
+lda_model <- LDA(dfm_keywords, k = 5)  # k是想要識別的主題數量
+
+# 查看主題的詞
+topics <- terms(lda_model, 10)  # 每個主題顯示前10個詞
+print(topics)
+
+# 計算每個詞的總頻率
+term_frequency <- colSums(as.matrix(dfm_keywords))
+
+# 生成互動式的LDA主題模型
+lda_vis <- createJSON(phi = posterior(lda_model)$terms,
+                      theta = posterior(lda_model)$topics,
+                      vocab = colnames(dfm_keywords),
+                      doc.length = rowSums(as.matrix(dfm_keywords)),
+                      term.frequency = term_frequency,  
+                      R = 30)
+
+serVis(lda_vis)
+```
+
+
+<br><br><br>
+
+
+# 共詞分析
+```{r echo=F, message=FALSE, warning=FALSE}
+# 構建詞共現矩陣
+fcmat <- fcm(tokens_list)
+
+# 將共現矩陣轉換為 dfm
+dfm_tokens <- dfm(tokens_list)
+
+# 使用 textstat_frequency 選擇最常出現的前15個詞
+top_features_df <- textstat_frequency(dfm_tokens, n = 15)
+top_features <- top_features_df$feature
+
+# 選擇前15個詞的詞共現矩陣
+fcmat_select <- fcm_select(fcmat, pattern = top_features)
+
+# 將詞共現矩陣轉換為 igraph 對象
+graph <- graph_from_adjacency_matrix(as.matrix(fcmat_select), weighted = TRUE, mode = "undirected", diag = FALSE)
+
+# 調整權重閾值，保留更多的邊
+E(graph)$weight <- E(graph)$weight / max(E(graph)$weight) * 10  # 邊的權重
+E(graph)$width <- E(graph)$weight
+E(graph)$weight[E(graph)$weight < 2] <- 0  # 調整閾值，保留權重較高的邊
+graph <- delete.edges(graph, E(graph)[weight == 0])
+
+# 移除孤立點
+graph <- delete.vertices(graph, degree(graph) == 0)
+
+# 設置節點標籤和大小
+V(graph)$label <- V(graph)$name
+V(graph)$size <- degree(graph) * 5  # 調整節點大小
+V(graph)$color <- ifelse(degree(graph) > 5, "red", "lightblue")  # 根據度數設置節點顏色
+
+# 繪製共詞網絡圖
+ggraph(graph, layout = "fr") +
+  geom_edge_link(aes(width = width), alpha = 0.6, color = "gray") +
+  geom_node_point(aes(size = size, color = color)) +
+  geom_node_text(aes(label = label), repel = TRUE, size = 5) +  # 調整標籤字體大小
+  theme_void() +
+  scale_color_identity() +
+  labs(title = "Co-occurrence Network of Keywords") +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+```{r echo=F, message=FALSE, warning=FALSE}
+
+```
+
